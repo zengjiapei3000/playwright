@@ -3,7 +3,7 @@ set -e
 set +x
 
 if [[ $(uname) != MINGW* ]]; then
-  echo "ERROR: this script is desgined to be run on MINGW. Can't run on $(uname)"
+  echo "ERROR: this script is designed to be run on MINGW. Can't run on $(uname)"
   exit 1
 fi
 
@@ -50,6 +50,8 @@ while true; do
   ../checkout_build_archive_upload.sh firefox-win32 || true
   git pull origin master
   ../checkout_build_archive_upload.sh firefox-win64 || true
+  git pull origin master
+  ../checkout_build_archive_upload.sh winldd-win64 || true
   newTimestamp=$(date +%s)
   delta=$(( 300 - newTimestamp + timestamp ));
   if (( delta > 0 )); then

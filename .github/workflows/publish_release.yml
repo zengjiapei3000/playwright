@@ -1,0 +1,56 @@
+name: "release"
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-npm-release:
+    name: "publish to NPM"
+    runs-on: ubuntu-18.04
+    if: github.repository == 'microsoft/playwright'
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-node@v1
+      with:
+        node-version: 10
+        registry-url: 'https://registry.npmjs.org'
+    - uses: microsoft/playwright-github-action@v1
+    - run: npm ci
+    - run: npm run build
+    - run: utils/publish_all_packages.sh --release
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-docker-release:
+    name: "publish to DockerHub"
+    # We use `docker push --all-tags` to push all tags which is a newly addition to docker
+    runs-on: ubuntu-20.04
+    if: github.repository == 'microsoft/playwright'
+    steps:
+    - uses: actions/checkout@v2
+    - uses: azure/docker-login@v1
+      with:
+        login-server: playwright.azurecr.io
+        username: playwright
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    - uses: microsoft/playwright-github-action@v1
+    - uses: actions/setup-node@v1
+      with:
+        node-version: 10.15
+    - run: npm ci
+    - run: npm run build
+    - run: ./docs/docker/build.sh bionic playwright:localbuild-bionic
+    - run: ./docs/docker/build.sh focal playwright:localbuild-focal
+    - name: tag & publish
+      run: |
+        # GITHUB_REF has a form of `refs/tags/v1.3.0`.
+        # TAG_NAME would be `v1.3.0`
+        TAG_NAME=${GITHUB_REF#refs/tags/}
+        ./docs/docker/tag_and_push.sh playwright:localbuild-bionic playwright.azurecr.io/public/playwright:latest
+        ./docs/docker/tag_and_push.sh playwright:localbuild-bionic playwright.azurecr.io/public/playwright:bionic
+        ./docs/docker/tag_and_push.sh playwright:localbuild-bionic playwright.azurecr.io/public/playwright:${TAG_NAME}
+        ./docs/docker/tag_and_push.sh playwright:localbuild-bionic playwright.azurecr.io/public/playwright:${TAG_NAME}-bionic
+
+        ./docs/docker/tag_and_push.sh playwright:localbuild-focal playwright.azurecr.io/public/playwright:focal
+        ./docs/docker/tag_and_push.sh playwright:localbuild-focal playwright.azurecr.io/public/playwright:${TAG_NAME}-focal

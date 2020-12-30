@@ -18,9 +18,9 @@ const child_process = require('child_process');
 const path = require('path');
 
 const files = [
-  path.join('src', 'injected', 'zsSelectorEngine.webpack.config.js'),
-  path.join('src', 'injected', 'injected.webpack.config.js'),
-  path.join('src', 'web.webpack.config.js'),
+  path.join('src', 'server', 'injected', 'injectedScript.webpack.config.js'),
+  path.join('src', 'server', 'injected', 'utilityScript.webpack.config.js'),
+  path.join('src', 'debug', 'injected', 'debugScript.webpack.config.js'),
 ];
 
 function runOne(runner, file) {

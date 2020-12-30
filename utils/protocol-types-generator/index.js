@@ -5,30 +5,35 @@ const StreamZip = require('node-stream-zip');
 const vm = require('vm');
 const os = require('os');
 
-async function generateChromiunProtocol(revision) {
-  const outputPath = path.join(__dirname, '..', '..', 'src', 'chromium', 'protocol.ts');
-  if (revision.local && fs.existsSync(outputPath))
-    return;
-  const playwright = await require('../../index').chromium;
-  const browserApp = await playwright.launchBrowserApp({executablePath: revision.executablePath, webSocket: true});
-  const origin = browserApp.wsEndpoint().match(/ws:\/\/([0-9A-Za-z:\.]*)\//)[1];
-  const browser = await playwright.connect(browserApp.connectOptions());
-  const page = await browser.defaultContext().newPage();
-  await page.goto(`http://${origin}/json/protocol`);
+async function generateProtocol(name, executablePath) {
+  if (name === 'chromium')
+    return generateChromiumProtocol(executablePath);
+  if (name === 'firefox')
+    return generateFirefoxProtocol(executablePath);
+  if (name === 'webkit')
+    return generateWebKitProtocol(executablePath);
+}
+
+async function generateChromiumProtocol(executablePath) {
+  const outputPath = path.join(__dirname, '../../src/server/chromium/protocol.ts');
+  const playwright = require('../../index').chromium;
+  const browser = await playwright.launch({ executablePath, args: ['--remote-debugging-port=9339'] });
+  const page = await browser.newPage();
+  await page.goto(`http://localhost:9339/json/protocol`);
   const json = JSON.parse(await page.evaluate(() => document.documentElement.innerText));
-  await browserApp.close();
-  fs.writeFileSync(outputPath, jsonToTS(json));
+  await browser.close();
+  await fs.promises.writeFile(outputPath, jsonToTS(json));
   console.log(`Wrote protocol.ts to ${path.relative(process.cwd(), outputPath)}`);
 }
 
-async function generateWebKitProtocol(revision) {
-  const outputPath = path.join(__dirname, '..', '..', 'src', 'webkit', 'protocol.ts');
-  if (revision.local && fs.existsSync(outputPath))
-    return;
-  const json = JSON.parse(fs.readFileSync(path.join(revision.folderPath, 'protocol.json'), 'utf8'));
-  fs.writeFileSync(outputPath, jsonToTS({domains: json}));
+async function generateWebKitProtocol(folderPath) {
+  const outputPath = path.join(__dirname, '../../src/server/webkit/protocol.ts');
+  const json = JSON.parse(await fs.promises.readFile(path.join(folderPath, '../protocol.json'), 'utf8'));
+  await fs.promises.writeFile(outputPath, jsonToTS({domains: json}));
   console.log(`Wrote protocol.ts for WebKit to ${path.relative(process.cwd(), outputPath)}`);
 }
+
+const conditionFilter = command => command.condition !== 'defined(WTF_PLATFORM_IOS_FAMILY) && WTF_PLATFORM_IOS_FAMILY';
 
 function jsonToTS(json) {
   return `// This is generated from /utils/protocol-types-generator/index.js
@@ -59,7 +64,7 @@ export module Protocol {${json.domains.map(domain => `${domain.description ? `
       ${parameter.name}${parameter.optional ? '?' : ''}: ${typeOfProperty(parameter)};`).join(``)}
     }` : `
     export type ${event.name}Payload = void;`}`).join('')}
-    ${(domain.commands || []).map(command => `${command.description ? `
+    ${(domain.commands || []).filter(conditionFilter).map(command => `${command.description ? `
     /**
      * ${command.description}
      */` : ''}
@@ -80,10 +85,10 @@ export module Protocol {${json.domains.map(domain => `${domain.description ? `
   export interface Events {${json.domains.map(domain => (domain.events || []).map(event => `
     "${domain.domain}.${event.name}": ${domain.domain}.${event.name}Payload;`).join('')).join('')}
   }
-  export interface CommandParameters {${json.domains.map(domain => (domain.commands || []).map(command => `
+  export interface CommandParameters {${json.domains.map(domain => (domain.commands || []).filter(conditionFilter).map(command => `
     "${domain.domain}.${command.name}": ${domain.domain}.${command.name}Parameters;`).join('')).join('')}
   }
-  export interface CommandReturnValues {${json.domains.map(domain => (domain.commands || []).map(command => `
+  export interface CommandReturnValues {${json.domains.map(domain => (domain.commands || []).filter(conditionFilter).map(command => `
     "${domain.domain}.${command.name}": ${domain.domain}.${command.name}ReturnValue;`).join('')).join('')}
   }
 }
@@ -118,13 +123,11 @@ function typeOfProperty(property, domain) {
   return property.type;
 }
 
-async function generateFirefoxProtocol(revision) {
-  const outputPath = path.join(__dirname, '..', '..', 'src', 'firefox', 'protocol.ts');
-  if (revision.local && fs.existsSync(outputPath))
-    return;
+async function generateFirefoxProtocol(executablePath) {
+  const outputPath = path.join(__dirname, '../../src/server/firefox/protocol.ts');
   const omnija = os.platform() === 'darwin' ?
-    path.join(revision.executablePath, '..', '..', 'Resources', 'omni.ja') :
-    path.join(revision.executablePath, '..', 'omni.ja');
+    path.join(executablePath, '../../Resources/omni.ja') :
+    path.join(executablePath, '../omni.ja');
   const zip = new StreamZip({file: omnija, storeEntries: true});
   // @ts-ignore
   await new Promise(x => zip.on('ready', x));
@@ -164,7 +167,7 @@ async function generateFirefoxProtocol(revision) {
     }
   }
   const json = vm.runInContext(`(${inject})();${protocolJSCode}; this.protocol;`, ctx);
-  fs.writeFileSync(outputPath, firefoxJSONToTS(json));
+  await fs.promises.writeFile(outputPath, firefoxJSONToTS(json));
   console.log(`Wrote protocol.ts for Firefox to ${path.relative(process.cwd(), outputPath)}`);
 }
 
@@ -216,4 +219,4 @@ function firefoxTypeToString(type, indent='    ') {
   return type['$type'];
 }
 
-module.exports = {generateChromiunProtocol, generateFirefoxProtocol, generateWebKitProtocol};
+module.exports = { generateProtocol };

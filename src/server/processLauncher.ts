@@ -16,46 +16,56 @@
  */
 
 import * as childProcess from 'child_process';
-import * as stream from 'stream';
-import * as removeFolder from 'rimraf';
-import { helper } from '../helper';
 import * as readline from 'readline';
-import { TimeoutError } from '../errors';
-import * as platform from '../platform';
+import * as removeFolder from 'rimraf';
+import { helper } from './helper';
+import * as types from './types';
+import { isUnderTest } from '../utils/utils';
 
-const debugLauncher = platform.debug('pw:launcher');
-const removeFolderAsync = platform.promisify(removeFolder);
+export type Env = {[key: string]: string | number | boolean | undefined};
 
 export type LaunchProcessOptions = {
   executablePath: string,
   args: string[],
-  env?: {[key: string]: string | undefined},
+  env?: Env,
 
   handleSIGINT?: boolean,
   handleSIGTERM?: boolean,
   handleSIGHUP?: boolean,
-  dumpio?: boolean,
-  pipe?: boolean,
-  tempDir?: string,
+  stdio: 'pipe' | 'stdin',
+  tempDirectories: string[],
+
+  cwd?: string,
 
   // Note: attemptToGracefullyClose should reject if it does not close the browser.
   attemptToGracefullyClose: () => Promise<any>,
-  onkill: (exitCode: number | null, signal: string | null) => void,
+  onExit: (exitCode: number | null, signal: string | null) => void,
+  log: (message: string) => void,
 };
 
-type LaunchResult = { launchedProcess: childProcess.ChildProcess, gracefullyClose: () => Promise<void> };
+type LaunchResult = {
+  launchedProcess: childProcess.ChildProcess,
+  gracefullyClose: () => Promise<void>,
+  kill: () => Promise<void>,
+};
 
-let lastLaunchedId = 0;
+const gracefullyCloseSet = new Set<() => Promise<void>>();
+
+export async function gracefullyCloseAll() {
+  await Promise.all(Array.from(gracefullyCloseSet).map(gracefullyClose => gracefullyClose().catch(e => {})));
+}
+
+// We currently spawn a process per page when recording video in Chromium.
+//  This triggers "too many listeners" on the process object once you have more than 10 pages open.
+const maxListeners = process.getMaxListeners();
+if (maxListeners !== 0)
+  process.setMaxListeners(Math.max(maxListeners || 0, 100));
 
 export async function launchProcess(options: LaunchProcessOptions): Promise<LaunchResult> {
-  const id = ++lastLaunchedId;
-  let stdio: ('ignore' | 'pipe')[] = ['pipe', 'pipe', 'pipe'];
-  if (options.pipe) {
-    if (options.dumpio)
-      stdio = ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'];
-    else
-      stdio = ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'];
-  }
+  const cleanup = () => helper.removeFolders(options.tempDirectories);
+
+  const stdio: ('ignore' | 'pipe')[] = options.stdio === 'pipe' ? ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'];
+  options.log(`<launching> ${options.executablePath} ${options.args.join(' ')}`);
   const spawnedProcess = childProcess.spawn(
       options.executablePath,
       options.args,
@@ -64,76 +74,92 @@ export async function launchProcess(options: LaunchProcessOptions): Promise<Laun
         // process group, making it possible to kill child process tree with `.kill(-pid)` command.
         // @see https://nodejs.org/api/child_process.html#child_process_options_detached
         detached: process.platform !== 'win32',
-        env: options.env,
-        stdio
+        env: (options.env as {[key: string]: string}),
+        cwd: options.cwd,
+        stdio,
       }
   );
-  debugLauncher(`[${id}] <launching> ${options.executablePath} ${options.args.join(' ')}`);
+
+  // Prevent Unhandled 'error' event.
+  spawnedProcess.on('error', () => {});
 
   if (!spawnedProcess.pid) {
-    let reject: (e: Error) => void;
-    const result = new Promise<LaunchResult>((f, r) => reject = r);
+    let failed: (e: Error) => void;
+    const failedPromise = new Promise<Error>((f, r) => failed = f);
     spawnedProcess.once('error', error => {
-      reject(new Error('Failed to launch browser: ' + error));
+      failed(new Error('Failed to launch browser: ' + error));
     });
-    return result;
+    return cleanup().then(() => failedPromise).then(e => Promise.reject(e));
   }
+  options.log(`<launched> pid=${spawnedProcess.pid}`);
 
-  if (options.dumpio) {
-    spawnedProcess.stderr.pipe(process.stderr);
-    spawnedProcess.stdout.pipe(process.stdout);
-  }
+  const stdout = readline.createInterface({ input: spawnedProcess.stdout });
+  stdout.on('line', (data: string) => {
+    options.log('[out] ' + data);
+  });
+
+  const stderr = readline.createInterface({ input: spawnedProcess.stderr });
+  stderr.on('line', (data: string) => {
+    options.log('[err] ' + data);
+  });
 
   let processClosed = false;
-  const waitForProcessToClose = new Promise((fulfill, reject) => {
-    spawnedProcess.once('exit', (exitCode, signal) => {
-      debugLauncher(`[${id}] <process did exit>`);
-      processClosed = true;
-      helper.removeEventListeners(listeners);
-      options.onkill(exitCode, signal);
-      // Cleanup as processes exit.
-      if (options.tempDir) {
-        removeFolderAsync(options.tempDir)
-            .catch((err: Error) => console.error(err))
-            .then(fulfill);
-      } else {
-        fulfill();
-      }
-    });
+  let fulfillClose = () => {};
+  const waitForClose = new Promise<void>(f => fulfillClose = f);
+  let fulfillCleanup = () => {};
+  const waitForCleanup = new Promise<void>(f => fulfillCleanup = f);
+  spawnedProcess.once('exit', (exitCode, signal) => {
+    options.log(`<process did exit: exitCode=${exitCode}, signal=${signal}>`);
+    processClosed = true;
+    helper.removeEventListeners(listeners);
+    gracefullyCloseSet.delete(gracefullyClose);
+    options.onExit(exitCode, signal);
+    fulfillClose();
+    // Cleanup as process exits.
+    cleanup().then(fulfillCleanup);
   });
 
   const listeners = [ helper.addEventListener(process, 'exit', killProcess) ];
   if (options.handleSIGINT) {
     listeners.push(helper.addEventListener(process, 'SIGINT', () => {
-      gracefullyClose().then(() => process.exit(130));
+      gracefullyClose().then(() => {
+        // Give tests a chance to dispatch any async calls.
+        if (isUnderTest())
+          setTimeout(() => process.exit(130), 0);
+        else
+          process.exit(130);
+      });
     }));
   }
   if (options.handleSIGTERM)
     listeners.push(helper.addEventListener(process, 'SIGTERM', gracefullyClose));
   if (options.handleSIGHUP)
     listeners.push(helper.addEventListener(process, 'SIGHUP', gracefullyClose));
+  gracefullyCloseSet.add(gracefullyClose);
 
   let gracefullyClosing = false;
   async function gracefullyClose(): Promise<void> {
+    gracefullyCloseSet.delete(gracefullyClose);
     // We keep listeners until we are done, to handle 'exit' and 'SIGINT' while
     // asynchronously closing to prevent zombie processes. This might introduce
     // reentrancy to this function, for example user sends SIGINT second time.
     // In this case, let's forcefully kill the process.
     if (gracefullyClosing) {
-      debugLauncher(`[${id}] <forecefully close>`);
+      options.log(`<forecefully close>`);
       killProcess();
+      await waitForClose;  // Ensure the process is dead and we called options.onkill.
       return;
     }
     gracefullyClosing = true;
-    debugLauncher(`[${id}] <gracefully close start>`);
-    options.attemptToGracefullyClose().catch(() => killProcess());
-    await waitForProcessToClose;
-    debugLauncher(`[${id}] <gracefully close end>`);
+    options.log(`<gracefully close start>`);
+    await options.attemptToGracefullyClose().catch(() => killProcess());
+    await waitForCleanup;  // Ensure the process is dead and we have cleaned up.
+    options.log(`<gracefully close end>`);
   }
 
   // This method has to be sync to be used as 'exit' event handler.
   function killProcess() {
-    debugLauncher(`[${id}] <kill>`);
+    options.log(`<kill>`);
     helper.removeEventListeners(listeners);
     if (spawnedProcess.pid && !spawnedProcess.killed && !processClosed) {
       // Force kill the browser.
@@ -146,57 +172,24 @@ export async function launchProcess(options: LaunchProcessOptions): Promise<Laun
         // the process might have already stopped
       }
     }
-    // Attempt to remove temporary profile directory to avoid littering.
     try {
-      if (options.tempDir)
-        removeFolder.sync(options.tempDir);
+      // Attempt to remove temporary directories to avoid littering.
+      for (const dir of options.tempDirectories)
+        removeFolder.sync(dir);
     } catch (e) { }
   }
 
-  return { launchedProcess: spawnedProcess, gracefullyClose };
+  function killAndWait() {
+    killProcess();
+    return waitForCleanup;
+  }
+
+  return { launchedProcess: spawnedProcess, gracefullyClose, kill: killAndWait };
 }
 
-export function waitForLine(process: childProcess.ChildProcess, inputStream: stream.Readable, regex: RegExp, timeout: number, timeoutError: TimeoutError): Promise<RegExpMatchArray> {
-  return new Promise((resolve, reject) => {
-    const rl = readline.createInterface({ input: inputStream });
-    let stderr = '';
-    const listeners = [
-      helper.addEventListener(rl, 'line', onLine),
-      helper.addEventListener(rl, 'close', () => onClose()),
-      helper.addEventListener(process, 'exit', () => onClose()),
-      helper.addEventListener(process, 'error', error => onClose(error))
-    ];
-    const timeoutId = timeout ? setTimeout(onTimeout, timeout) : 0;
-
-    function onClose(error?: Error) {
-      cleanup();
-      reject(new Error([
-        'Failed to launch browser!' + (error ? ' ' + error.message : ''),
-        stderr,
-        '',
-        'TROUBLESHOOTING: https://github.com/Microsoft/playwright/blob/master/docs/troubleshooting.md',
-        '',
-      ].join('\n')));
-    }
-
-    function onTimeout() {
-      cleanup();
-      reject(timeoutError);
-    }
-
-    function onLine(line: string) {
-      stderr += line + '\n';
-      const match = line.match(regex);
-      if (!match)
-        return;
-      cleanup();
-      resolve(match);
-    }
-
-    function cleanup() {
-      if (timeoutId)
-        clearTimeout(timeoutId);
-      helper.removeEventListeners(listeners);
-    }
-  });
+export function envArrayToObject(env: types.EnvArray): Env {
+  const result: Env = {};
+  for (const { name, value } of env)
+    result[name] = value;
+  return result;
 }

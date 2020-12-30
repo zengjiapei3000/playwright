@@ -3,13 +3,13 @@ set -e
 set +x
 
 if [[ "$(uname)" != "Darwin" ]]; then
-  echo "ERROR: this script is desgined to be run on OSX. Can't run on $(uname)"
+  echo "ERROR: this script is designed to be run on OSX. Can't run on $(uname)"
   exit 1
 fi
 
 MAC_MAJOR_MINOR_VERSION=$(sw_vers -productVersion | grep -o '^\d\+.\d\+')
 if [[ $MAC_MAJOR_MINOR_VERSION != "10.14" ]]; then
-  echo "ERROR: this script is desgined to be run on OSX 10.14. Can't run on OSX $MAC_MAJOR_MINOR_VERSION"
+  echo "ERROR: this script is designed to be run on OSX 10.14. Can't run on OSX $MAC_MAJOR_MINOR_VERSION"
   exit 1
 fi
 
@@ -61,7 +61,10 @@ if [[ -n $(git status -s) ]]; then
 fi
 
 git pull origin master
-../checkout_build_archive_upload.sh firefox-mac >/tmp/$(basename $0)--firefox-mac.log || true
+../checkout_build_archive_upload.sh firefox-mac-10.14 >/tmp/$(basename $0)--firefox-mac.log || true
 
 git pull origin master
 ../checkout_build_archive_upload.sh webkit-mac-10.14 >/tmp/$(basename $0)--webkit-mac-10.14.log || true
+
+git pull origin master
+../checkout_build_archive_upload.sh ffmpeg-mac >/tmp/$(basename $0)--ffmpeg-mac.log || true

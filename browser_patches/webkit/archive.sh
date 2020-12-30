@@ -3,7 +3,7 @@ set -e
 set +x
 
 if [[ ("$1" == "-h") || ("$1" == "--help") ]]; then
-  echo "usage: $(basename $0) [output-absolute-path] [--wpe]"
+  echo "usage: $(basename $0) [output-absolute-path]"
   echo
   echo "Generate distributable .zip archive from ./checkout folder that was previously built."
   echo
@@ -11,7 +11,6 @@ if [[ ("$1" == "-h") || ("$1" == "--help") ]]; then
 fi
 
 ZIP_PATH=$1
-USE_WPE=$2
 if [[ $ZIP_PATH != /* ]]; then
   echo "ERROR: path $ZIP_PATH is not absolute"
   exit 1
@@ -30,7 +29,12 @@ if ! [[ -d $(dirname $ZIP_PATH) ]]; then
 fi
 
 main() {
-  cd checkout
+  if [[ ! -z "${WK_CHECKOUT_PATH}" ]]; then
+    cd "${WK_CHECKOUT_PATH}"
+    echo "WARNING: checkout path from WK_CHECKOUT_PATH env: ${WK_CHECKOUT_PATH}"
+  else
+    cd "checkout"
+  fi
 
   set -x
   if [[ "$(uname)" == "Darwin" ]]; then
@@ -45,47 +49,42 @@ main() {
   fi
 }
 
+
 createZipForLinux() {
   # create a TMP directory to copy all necessary files
   local tmpdir=$(mktemp -d -t webkit-deploy-XXXXXXXXXX)
   mkdir -p $tmpdir
 
   # copy runner
-  cp -t $tmpdir ../pw_run.sh
+  cp -t $tmpdir $SCRIPTS_DIR/pw_run.sh
   # copy protocol
-  node ../concat_protocol.js > $tmpdir/protocol.json
+  node $SCRIPTS_DIR/concat_protocol.js > $tmpdir/protocol.json
 
-  if [[ -n $USE_WPE ]]; then
-    # copy all relevant binaries
-    cp -t $tmpdir ./WebKitBuild/WPE/Release/bin/MiniBrowser ./WebKitBuild/WPE/Release/bin/WPE*Process
-    # copy all relevant shared objects
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib" ldd WebKitBuild/WPE/Release/bin/MiniBrowser | grep -o '[^ ]*WebKitBuild/WPE/[^ ]*' | xargs cp -t $tmpdir
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib" ldd WebKitBuild/WPE/Release/bin/WPENetworkProcess | grep -o '[^ ]*WebKitBuild/WPE/[^ ]*' | xargs cp -t $tmpdir
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib" ldd WebKitBuild/WPE/Release/bin/WPEWebProcess | grep -o '[^ ]*WebKitBuild/WPE/[^ ]*' | xargs cp -t $tmpdir
-    mkdir -p $tmpdir/gio/modules
-    cp -t $tmpdir/gio/modules $PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib/gio/modules/*
-
-    cd $tmpdir
-    ln -s libWPEBackend-fdo-1.0.so.1 libWPEBackend-fdo-1.0.so
-    cd -
-  else
-    # copy all relevant binaries
-    cp -t $tmpdir ./WebKitBuild/GTK/Release/bin/MiniBrowser ./WebKitBuild/GTK/Release/bin/WebKit*Process
-    # copy all relevant shared objects
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/GTK/DependenciesGTK/Root/lib" ldd WebKitBuild/GTK/Release/bin/MiniBrowser | grep -o '[^ ]*WebKitBuild/GTK/[^ ]*' | xargs cp -t $tmpdir
-    mkdir -p $tmpdir/gio/modules
-    cp -t $tmpdir/gio/modules $PWD/WebKitBuild/GTK/DependenciesGTK/Root/lib/gio/modules/*
-
-    # we failed to nicely build libgdk_pixbuf - expect it in the env
-    rm $tmpdir/libgdk_pixbuf*
-  fi
+  # Generate and unpack MiniBrowser bundles for each port
+  for port in gtk wpe; do
+    WEBKIT_OUTPUTDIR=$(pwd)/WebKitBuild/${port^^} Tools/Scripts/generate-bundle \
+        --bundle=MiniBrowser --release \
+        --platform=${port} --destination=${tmpdir}
+     unzip ${tmpdir}/MiniBrowser_${port}_release.zip -d ${tmpdir}/minibrowser-${port}
+     rm -f ${tmpdir}/MiniBrowser_${port}_release.zip
+  done
 
   # tar resulting directory and cleanup TMP.
   cd $tmpdir
-  strip --strip-unneeded * || true
   zip --symlinks -r $ZIP_PATH ./
   cd -
   rm -rf $tmpdir
+}
+
+# see https://docs.microsoft.com/en-us/visualstudio/install/tools-for-managing-visual-studio-instances?view=vs-2019
+printMSVCRedistDir() {
+  local dll_file=$("C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find '**\Redist\MSVC\*\x64\**\vcruntime140.dll')
+  local redist_dir=$(dirname "$dll_file")
+  if ! [[ -d $redist_dir ]]; then
+    echo "ERROR: cannot find MS VS C++ redistributable $redist_dir"
+    exit 1;
+  fi
+  echo "$redist_dir"
 }
 
 createZipForWindows() {
@@ -96,15 +95,15 @@ createZipForWindows() {
   cp -t $tmpdir ./WebKitLibraries/win/bin64/*.dll
   cd WebKitBuild/Release/bin64
   cp -r -t $tmpdir WebKit.resources
-  cp -t $tmpdir JavaScriptCore.dll MiniBrowserLib.dll WTF.dll WebKit2.dll libEGL.dll libGLESv2.dll
-  cp -t $tmpdir MiniBrowser.exe WebKitNetworkProcess.exe WebKitWebProcess.exe
+  cp -t $tmpdir JavaScriptCore.dll PlaywrightLib.dll WTF.dll WebKit2.dll libEGL.dll libGLESv2.dll
+  cp -t $tmpdir Playwright.exe WebKitNetworkProcess.exe WebKitWebProcess.exe
   cd -
-  cd /c/WEBKIT_WIN64_LIBS
-  cp -t $tmpdir msvcp140.dll vcruntime140.dll vcruntime140_1.dll
+  cd "$(printMSVCRedistDir)"
+  cp -t $tmpdir msvcp140.dll vcruntime140.dll vcruntime140_1.dll msvcp140_2.dll
   cd -
 
   # copy protocol
-  node ../concat_protocol.js > $tmpdir/protocol.json
+  node $SCRIPTS_DIR/concat_protocol.js > $tmpdir/protocol.json
   # tar resulting directory and cleanup TMP.
   cd $tmpdir
   zip -r $ZIP_PATH ./
@@ -124,14 +123,13 @@ createZipForMac() {
   ditto {./WebKitBuild/Release,$tmpdir}/libwebrtc.dylib
   ditto {./WebKitBuild/Release,$tmpdir}/Playwright.app
   ditto {./WebKitBuild/Release,$tmpdir}/PluginProcessShim.dylib
-  ditto {./WebKitBuild/Release,$tmpdir}/SecItemShim.dylib
   ditto {./WebKitBuild/Release,$tmpdir}/WebCore.framework
   ditto {./WebKitBuild/Release,$tmpdir}/WebInspectorUI.framework
   ditto {./WebKitBuild/Release,$tmpdir}/WebKit.framework
   ditto {./WebKitBuild/Release,$tmpdir}/WebKitLegacy.framework
-  ditto {..,$tmpdir}/pw_run.sh
+  ditto {$SCRIPTS_DIR,$tmpdir}/pw_run.sh
   # copy protocol
-  node ../concat_protocol.js > $tmpdir/protocol.json
+  node $SCRIPTS_DIR/concat_protocol.js > $tmpdir/protocol.json
 
   # zip resulting directory and cleanup TMP.
   ditto -c -k $tmpdir $ZIP_PATH
@@ -140,5 +138,6 @@ createZipForMac() {
 
 trap "cd $(pwd -P)" EXIT
 cd "$(dirname "$0")"
+SCRIPTS_DIR="$(pwd -P)"
 
 main "$@"

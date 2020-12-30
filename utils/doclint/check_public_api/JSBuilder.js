@@ -19,16 +19,15 @@ const ts = require('typescript');
 const path = require('path');
 const Documentation = require('./Documentation');
 const EventEmitter = require('events');
-module.exports = { checkSources, expandPrefix };
+module.exports = { checkSources };
 
 /**
  * @param {!Array<!import('../Source')>} sources
- * @param {!Array<string>} externalDependencies
  */
-function checkSources(sources, externalDependencies) {
+function checkSources(sources) {
   // special treatment for Events.js
   const classEvents = new Map();
-  const eventsSources = sources.filter(source => source.name().startsWith('events.ts'));
+  const eventsSources = sources.filter(source => source.name().startsWith('events.'));
   for (const eventsSource of eventsSources) {
     const {Events} = require(eventsSource.filePath().endsWith('.js') ? eventsSource.filePath() : eventsSource.filePath().replace(/\bsrc\b/, 'lib').replace('.ts', '.js'));
     for (const [className, events] of Object.entries(Events))
@@ -40,6 +39,7 @@ function checkSources(sources, externalDependencies) {
     options: {
       allowJs: true,
       target: ts.ScriptTarget.ESNext,
+      strict: true
     },
     rootNames: sources.map(source => source.filePath())
   });
@@ -80,7 +80,7 @@ function checkSources(sources, externalDependencies) {
           visit(classesByName.get(parent));
       };
       visit(cls);
-      return new Documentation.Class(expandPrefix(cls.name), Array.from(membersMap.values()));
+      return new Documentation.Class(cls.name, Array.from(membersMap.values()), undefined, cls.comment, cls.templates);
     });
   }
 
@@ -99,42 +99,14 @@ function checkSources(sources, externalDependencies) {
           parent = parent.parent;
         className = path.basename(parent.fileName,  '.js');
       }
-      if (className && !excludeClasses.has(className)) {
+      if (className && !excludeClasses.has(className) && !fileName.endsWith('/protocol.ts')) {
+        excludeClasses.add(className);
         classes.push(serializeClass(className, symbol, node));
         inheritance.set(className, parentClasses(node));
-        excludeClasses.add(className);
       }
     }
     if (fileName.endsWith('/api.ts') && ts.isExportSpecifier(node))
-      apiClassNames.add(expandPrefix((node.propertyName || node.name).text));
-    const isPlatform = fileName.endsWith('platform.ts');
-    if (!fileName.includes('src/server/')) {
-      // Only relative imports.
-      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
-        const module = node.moduleSpecifier.text;
-        const isRelative = module.startsWith('.');
-        const isPlatformDependency = isPlatform && externalDependencies.includes(module);
-        const isServerDependency = path.resolve(path.dirname(fileName), module).includes('src/server');
-        if (isServerDependency || (!isRelative && !isPlatformDependency)) {
-          const lac = ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.moduleSpecifier.pos);
-          errors.push(`Disallowed import "${module}" at ${node.getSourceFile().fileName}:${lac.line + 1}`);
-        }
-      }
-      // No references to external types.
-      if (!isPlatform && ts.isTypeReferenceNode(node)) {
-        const isPlatformReference = ts.isQualifiedName(node.typeName) && ts.isIdentifier(node.typeName.left) && node.typeName.left.escapedText === 'platform';
-        if (!isPlatformReference) {
-          const type = checker.getTypeAtLocation(node);
-          if (type.symbol && type.symbol.valueDeclaration) {
-            const source = type.symbol.valueDeclaration.getSourceFile();
-            if (source.fileName.includes('@types')) {
-              const lac = ts.getLineAndCharacterOfPosition(node.getSourceFile(), node.pos);
-              errors.push(`Disallowed type reference "${type.symbol.escapedName}" at ${node.getSourceFile().fileName}:${lac.line + 1}:${lac.character + 1}`);
-            }
-          }
-        }
-      }
-    }
+      apiClassNames.add((node.propertyName || node.name).text);
     ts.forEachChild(node, visit);
   }
 
@@ -152,15 +124,39 @@ function checkSources(sources, externalDependencies) {
     return parents;
   }
 
-  function serializeSymbol(symbol, circular = []) {
+  /**
+   * @param {ts.Symbol} symbol
+   * @param {string[]=} circular
+   * @param {boolean=} parentRequired
+   */
+  function serializeSymbol(symbol, circular = [], parentRequired = true) {
     const type = checker.getTypeOfSymbolAtLocation(symbol, symbol.valueDeclaration);
     const name = symbol.getName();
     if (symbol.valueDeclaration && symbol.valueDeclaration.dotDotDotToken) {
       const innerType = serializeType(type.typeArguments ? type.typeArguments[0] : type, circular);
       innerType.name = '...' + innerType.name;
-      return Documentation.Member.createProperty('...' + name, innerType);
+      const required = false;
+      return Documentation.Member.createProperty('...' + name, innerType, undefined, required);
     }
-    return Documentation.Member.createProperty(name, serializeType(type, circular));
+
+    const required = parentRequired && !typeHasUndefined(type);
+    return Documentation.Member.createProperty(name, serializeType(type, circular), undefined, required);
+  }
+
+  /**
+   * @param {!ts.Type} type
+   */
+  function typeHasUndefined(type) {
+    if (!type.isUnion())
+      return type.flags & ts.TypeFlags.Undefined;
+    return type.types.some(typeHasUndefined);
+  }
+
+  /**
+   * @param {!ts.Type} type
+   */
+  function isNotUndefined(type) {
+     return !(type.flags & ts.TypeFlags.Undefined);
   }
 
   /**
@@ -187,30 +183,30 @@ function checkSources(sources, externalDependencies) {
    * @return {!Documentation.Type}
    */
   function serializeType(type, circular = []) {
-    let typeName = checker.typeToString(type);
-    if (typeName === 'any' || typeName === '{ [x: string]: string; }')
+    let typeName = checker.typeToString(type).replace(/SmartHandle/g, 'Handle');
+    if (typeName === 'any')
       typeName = 'Object';
     const nextCircular = [typeName].concat(circular);
-
-    if (typeName === 'Selector') {
-      if (!excludeClasses.has(typeName)) {
-        const properties = type.getProperties().map(property => serializeSymbol(property, nextCircular));
-        classes.push(new Documentation.Class(typeName, properties));
-        excludeClasses.add(typeName);
-      }
-      return new Documentation.Type(typeName, []);
-    }
-
-    if (isRegularObject(type)) {
+    const stringIndexType = type.getStringIndexType();
+    if (stringIndexType) {
+      return new Documentation.Type(`Object<string, ${serializeType(stringIndexType, circular).name}>`);
+    } else if (isRegularObject(type)) {
       let properties = undefined;
       if (!circular.includes(typeName))
-        properties = type.getProperties().map(property => serializeSymbol(property, nextCircular));
+        properties = getTypeProperties(type).map(property => serializeSymbol(property, nextCircular));
       return new Documentation.Type('Object', properties);
     }
     if (type.isUnion() && (typeName.includes('|') || type.types.every(type => type.isStringLiteral() || type.intrinsicName === 'number'))) {
-      const types = type.types.map(type => serializeType(type, circular));
-      const name = types.map(type => type.name).join('|');
-      const properties = [].concat(...types.map(type => type.properties));
+      const types = type.types.filter(isNotUndefined).map((type, index) => {
+        return { isLiteral: type.isStringLiteral(), serialized: serializeType(type, circular), index };
+      });
+      types.sort((a, b) => {
+        if (!a.isLiteral || !b.isLiteral)
+          return a.index - b.index;
+        return a.serialized.name.localeCompare(b.serialized.name);
+      });
+      const name = types.map(type => type.serialized.name).join('|');
+      const properties = [].concat(...types.map(type => type.serialized.properties));
       return new Documentation.Type(name.replace(/false\|true/g, 'boolean'), properties);
     }
     if (type.typeArguments && type.symbol) {
@@ -222,11 +218,11 @@ function checkSources(sources, externalDependencies) {
           properties.push(...innerType.properties);
         innerTypeNames.push(innerType.name);
       }
-      if (innerTypeNames.length === 1 && innerTypeNames[0] === 'void')
+      if (innerTypeNames.length === 0 || (innerTypeNames.length === 1 && innerTypeNames[0] === 'void'))
         return new Documentation.Type(type.symbol.name);
       return new Documentation.Type(`${type.symbol.name}<${innerTypeNames.join(', ')}>`, properties);
     }
-    return new Documentation.Type(expandPrefix(typeName), []);
+    return new Documentation.Type(typeName, []);
   }
 
   /**
@@ -237,30 +233,42 @@ function checkSources(sources, externalDependencies) {
   function serializeClass(className, symbol, node) {
     /** @type {!Array<!Documentation.Member>} */
     const members = classEvents.get(className) || [];
+    const templates = [];
     for (const [name, member] of symbol.members || []) {
       if (className === 'Error')
         continue;
       if (name.startsWith('_'))
         continue;
+      if (member.valueDeclaration && ts.getCombinedModifierFlags(member.valueDeclaration) & ts.ModifierFlags.Private)
+        continue;
       if (EventEmitter.prototype.hasOwnProperty(name))
         continue;
-      if (className === 'CDPSession' && name === 'send') {
-        // special case CDPSession.send, which has a stricter private API than the public API
-        members.push(Documentation.Member.createMethod('send', [
-          Documentation.Member.createProperty('method', new Documentation.Type('string')),
-          Documentation.Member.createProperty('params', new Documentation.Type('Object')),
-        ], new Documentation.Type('Promise<Object>')));
-        continue;
-      }
       const memberType = checker.getTypeOfSymbolAtLocation(member, member.valueDeclaration);
-      const signature = memberType.getCallSignatures()[0];
-      if (signature)
+      const signature = signatureForType(memberType);
+      if (member.flags & ts.SymbolFlags.TypeParameter)
+        templates.push(name);
+      else if (signature)
         members.push(serializeSignature(name, signature));
       else
         members.push(serializeProperty(name, memberType));
     }
 
-    return new Documentation.Class(className, members);
+    return new Documentation.Class(className, members, undefined, undefined, templates);
+  }
+
+  /**
+   * @param {ts.Type} type
+   */
+  function signatureForType(type) {
+    const signatures = type.getCallSignatures();
+    if (signatures.length)
+      return signatures[signatures.length - 1];
+    if (type.isUnion()) {
+      const innerTypes = type.types.filter(isNotUndefined);
+      if (innerTypes.length === 1)
+        return signatureForType(innerTypes[0]);
+    }
+    return null;
   }
 
   /**
@@ -268,9 +276,11 @@ function checkSources(sources, externalDependencies) {
    * @param {!ts.Signature} signature
    */
   function serializeSignature(name, signature) {
-    const parameters = signature.parameters.map(s => serializeSymbol(s));
+    const minArgumentCount = signature.minArgumentCount || 0;
+    const parameters = signature.parameters.map((s, index) => serializeSymbol(s, [], index < minArgumentCount));
+    const templates = signature.typeParameters ? signature.typeParameters.map(t => t.symbol.name) : [];
     const returnType = serializeType(signature.getReturnType());
-    return Documentation.Member.createMethod(name, parameters, returnType.name !== 'void' ? returnType : null);
+    return Documentation.Member.createMethod(name, parameters, returnType.name !== 'void' ? returnType : null, undefined, undefined, templates);
   }
 
   /**
@@ -280,14 +290,25 @@ function checkSources(sources, externalDependencies) {
   function serializeProperty(name, type) {
     return Documentation.Member.createProperty(name, serializeType(type));
   }
-}
 
-function expandPrefix(name) {
-  if (name.startsWith('CR'))
-    return 'Chromium' + name.substring(2);
-  if (name.startsWith('FF'))
-    return 'Firefox' + name.substring(2);
-  if (name.startsWith('WK'))
-    return 'WebKit' + name.substring(2);
-  return name;
+  /**
+   * @param {!ts.Type} type
+   */
+  function getTypeProperties(type) {
+    if (type.aliasSymbol && type.aliasSymbol.escapedName === 'Pick') {
+      const props = getTypeProperties(type.aliasTypeArguments[0]);
+      const pickNames = type.aliasTypeArguments[1].types.map(t => t.value);
+      return props.filter(p => pickNames.includes(p.getName()));
+    }
+    if (!type.isIntersection())
+      return type.getProperties();
+    let props = [];
+    for (const innerType of type.types) {
+      let innerProps = getTypeProperties(innerType);
+      props = props.filter(p => !innerProps.find(e => e.getName() === p.getName()));
+      props = props.filter(p => p.getName() !== '_tracePath' && p.getName() !== '_traceResourcesPath');
+      props.push(...innerProps);
+    }
+    return props;
+  }
 }

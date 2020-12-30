@@ -14,25 +14,34 @@
  * limitations under the License.
  */
 
-import * as types from '../types';
-import { TimeoutError } from '../errors';
-import { DeviceDescriptors } from '../deviceDescriptors';
-import { Chromium } from './chromium';
-import { WebKit } from './webkit';
-import { Firefox } from './firefox';
+import * as browserPaths from '../utils/browserPaths';
+import { Android } from './android/android';
+import { AdbBackend } from './android/backendAdb';
+import { Chromium } from './chromium/chromium';
+import { Electron } from './electron/electron';
+import { Firefox } from './firefox/firefox';
+import { serverSelectors } from './selectors';
+import { WebKit } from './webkit/webkit';
 
 export class Playwright {
-  readonly devices: types.Devices;
-  readonly errors: { TimeoutError: typeof TimeoutError };
+  readonly selectors = serverSelectors;
   readonly chromium: Chromium;
+  readonly android: Android;
+  readonly electron: Electron;
   readonly firefox: Firefox;
   readonly webkit: WebKit;
 
-  constructor(projectRoot: string, revisions: { chromium_revision: string, firefox_revision: string, webkit_revision: string }) {
-    this.devices = DeviceDescriptors;
-    this.errors = { TimeoutError };
-    this.chromium = new Chromium(projectRoot, revisions.chromium_revision);
-    this.firefox = new Firefox(projectRoot, revisions.firefox_revision);
-    this.webkit = new WebKit(projectRoot, revisions.webkit_revision);
+  constructor(packagePath: string, browsers: browserPaths.BrowserDescriptor[]) {
+    const chromium = browsers.find(browser => browser.name === 'chromium');
+    this.chromium = new Chromium(packagePath, chromium!);
+
+    const firefox = browsers.find(browser => browser.name === 'firefox');
+    this.firefox = new Firefox(packagePath, firefox!);
+
+    const webkit = browsers.find(browser => browser.name === 'webkit');
+    this.webkit = new WebKit(packagePath, webkit!);
+
+    this.electron = new Electron();
+    this.android = new Android(new AdbBackend());
   }
 }

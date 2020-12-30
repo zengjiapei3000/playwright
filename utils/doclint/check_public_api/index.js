@@ -18,14 +18,9 @@ const jsBuilder = require('./JSBuilder');
 const mdBuilder = require('./MDBuilder');
 const Documentation = require('./Documentation');
 const Message = require('../Message');
-const path = require('path');
 
 const EXCLUDE_PROPERTIES = new Set([
-  'Browser.create',
-  'Headers.fromPayload',
-  'Page.create',
   'JSHandle.toString',
-  'TimeoutError.name',
 ]);
 
 /**
@@ -33,9 +28,9 @@ const EXCLUDE_PROPERTIES = new Set([
  * @param {!Array<!Source>} mdSources
  * @return {!Promise<!Array<!Message>>}
  */
-module.exports = async function lint(page, mdSources, jsSources, externalDependencies) {
-  const mdResult = await mdBuilder(page, mdSources);
-  const jsResult = jsBuilder.checkSources(jsSources, externalDependencies);
+module.exports = async function lint(page, mdSources, jsSources) {
+  const mdResult = await mdBuilder(page, mdSources, true);
+  const jsResult = jsBuilder.checkSources(jsSources);
   const jsDocumentation = filterJSDocumentation(jsSources, jsResult.documentation);
   const mdDocumentation = mdResult.documentation;
 
@@ -107,9 +102,9 @@ function compareDocumentations(actual, expected) {
   const expectedClasses = Array.from(expected.classes.keys()).sort();
   const classesDiff = diff(actualClasses, expectedClasses);
   for (const className of classesDiff.extra)
-    errors.push(`Non-existing class found: ${className}`);
+    errors.push(`Documented but not implemented class: ${className}`);
   for (const className of classesDiff.missing)
-    errors.push(`Class not found: ${className}`);
+    errors.push(`Implemented but not documented class: ${className}`);
 
   for (const className of classesDiff.equal) {
     const actualClass = actual.classes.get(className);
@@ -118,9 +113,9 @@ function compareDocumentations(actual, expected) {
     const expectedMethods = Array.from(expectedClass.methods.keys()).sort();
     const methodDiff = diff(actualMethods, expectedMethods);
     for (const methodName of methodDiff.extra)
-      errors.push(`Non-existing method found: ${className}.${methodName}()`);
+      errors.push(`Documented but not implemented method: ${className}.${methodName}()`);
     for (const methodName of methodDiff.missing)
-      errors.push(`Method not found: ${className}.${methodName}()`);
+      errors.push(`Implemented but not documented method: ${className}.${methodName}()`);
 
     for (const methodName of methodDiff.equal) {
       const actualMethod = actualClass.methods.get(methodName);
@@ -130,7 +125,7 @@ function compareDocumentations(actual, expected) {
           errors.push(`Method ${className}.${methodName} has unneeded description of return type`);
         else
           errors.push(`Method ${className}.${methodName} is missing return type description`);
-      } else if (actualMethod.hasReturn) {
+      } else if (actualMethod.type) {
         checkType(`Method ${className}.${methodName} has the wrong return type: `, actualMethod.type, expectedMethod.type);
       }
       const actualArgs = Array.from(actualMethod.args.keys());
@@ -139,9 +134,9 @@ function compareDocumentations(actual, expected) {
       if (argsDiff.extra.length || argsDiff.missing.length) {
         const text = [`Method ${className}.${methodName}() fails to describe its parameters:`];
         for (const arg of argsDiff.missing)
-          text.push(`- Argument not found: ${arg}`);
+          text.push(`- Implemented but not documented argument: ${arg}`);
         for (const arg of argsDiff.extra)
-          text.push(`- Non-existing argument found: ${arg}`);
+          text.push(`- Documented but not implemented argument: ${arg}`);
         errors.push(text.join('\n'));
       }
 
@@ -152,20 +147,20 @@ function compareDocumentations(actual, expected) {
     const expectedProperties = Array.from(expectedClass.properties.keys()).sort();
     const propertyDiff = diff(actualProperties, expectedProperties);
     for (const propertyName of propertyDiff.extra)
-      errors.push(`Non-existing property found: ${className}.${propertyName}`);
+      errors.push(`Documented but not implemented property: ${className}.${propertyName}`);
     for (const propertyName of propertyDiff.missing) {
       if (propertyName === 'T')
         continue;
-      errors.push(`Property not found: ${className}.${propertyName}`);
+      errors.push(`Implemented but not documented property: ${className}.${propertyName}`);
     }
 
     const actualEvents = Array.from(actualClass.events.keys()).sort();
     const expectedEvents = Array.from(expectedClass.events.keys()).sort();
     const eventsDiff = diff(actualEvents, expectedEvents);
     for (const eventName of eventsDiff.extra)
-      errors.push(`Non-existing event found in class ${className}: '${eventName}'`);
+      errors.push(`Documented but not implemented event ${className}: '${eventName}'`);
     for (const eventName of eventsDiff.missing)
-      errors.push(`Event not found in class ${className}: '${eventName}'`);
+      errors.push(`Implemented but not documented event ${className}: '${eventName}'`);
   }
 
 
@@ -175,7 +170,9 @@ function compareDocumentations(actual, expected) {
    * @param {!Documentation.Member} expected
    */
   function checkProperty(source, actual, expected) {
-    checkType(source + ' ' + actual.name, actual.type, expected.type);
+    if (actual.required !== expected.required)
+      errors.push(`${source}: ${actual.name} should be ${expected.required ? 'required' : 'optional'}`);
+    checkType(source + '.' + actual.name, actual.type, expected.type);
   }
 
   /**
@@ -189,21 +186,41 @@ function compareDocumentations(actual, expected) {
       return;
     if (expected.name === 'T' || expected.name.includes('[T]'))
       return;
-    // We don't have nullchecks on for TypeScript
-    const actualName = actual.name.replace(/[\? ]/g, '').replace(/ElementHandle\<Node\>/g, 'ElementHandle');
-    // TypeScript likes to add some spaces
-    const expectedName = expected.name.replace(/\ /g, '').replace(/ElementHandle\<Node\>/g, 'ElementHandle');
-    if (expectedName !== actualName)
+    /** @type {Parameters<typeof String.prototype.replace>[]} */
+    const mdReplacers = [
+      [/\ /g, ''],
+      // We shortcut ? to null|
+      [/\?/g, 'null|'],
+    ];
+    const tsReplacers = [
+      [/\ /g, ''],
+      [/ElementHandle\<Element\>/g, 'ElementHandle'],
+      [/ElementHandle\<Node\>/g, 'ElementHandle'],
+      [/ElementHandle\<T\>/g, 'ElementHandle'],
+      [/Handle\<R\>/g, 'JSHandle'],
+      [/JSHandle\<Object\>/g, 'JSHandle'],
+      [/object/g, 'Object'],
+      [/Promise\<T\>/, 'Promise<Object>']
+    ]
+    let actualName = actual.name;
+    for (const replacer of mdReplacers)
+      actualName = actualName.replace(...replacer);
+    let expectedName = expected.name;
+    for (const replacer of tsReplacers)
+      expectedName = expectedName.replace(...replacer);
+    if (normalizeType(expectedName) !== normalizeType(actualName))
       errors.push(`${source} ${actualName} != ${expectedName}`);
-    const actualPropertiesMap = new Map(actual.properties.map(property => [property.name, property.type]));
-    const expectedPropertiesMap = new Map(expected.properties.map(property => [property.name, property.type]));
+    if (actual.name === 'boolean' || actual.name === 'string')
+      return;
+    const actualPropertiesMap = new Map(actual.properties.map(property => [property.name, property]));
+    const expectedPropertiesMap = new Map(expected.properties.map(property => [property.name, property]));
     const propertiesDiff = diff(Array.from(actualPropertiesMap.keys()).sort(), Array.from(expectedPropertiesMap.keys()).sort());
     for (const propertyName of propertiesDiff.extra)
       errors.push(`${source} has unexpected property '${propertyName}'`);
     for (const propertyName of propertiesDiff.missing)
       errors.push(`${source} is missing property ${propertyName}`);
     for (const propertyName of propertiesDiff.equal)
-      checkType(source + '.' + propertyName, actualPropertiesMap.get(propertyName), expectedPropertiesMap.get(propertyName));
+      checkProperty(source, actualPropertiesMap.get(propertyName), expectedPropertiesMap.get(propertyName));
   }
 
   return errors;
@@ -282,3 +299,23 @@ function diff(actual, expected) {
   }
 }
 
+function normalizeType(type) {
+  let nesting = 0;
+  const result = [];
+  let word = '';
+  for (const c of type) {
+    if (c === '<') {
+      ++nesting;
+    } else if (c === '>') {
+      --nesting;
+    }
+    if (c === '|' && !nesting) {
+      result.push(word);
+      word = '';
+    } else {
+      word += c;
+    }
+  }
+  result.sort();
+  return result.join('|');
+}

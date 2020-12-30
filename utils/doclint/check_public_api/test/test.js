@@ -14,81 +14,69 @@
  * limitations under the License.
  */
 
+const fs = require('fs');
 const path = require('path');
-const playwright = require('../../../..');
+const playwright = require('../../../../');
 const checkPublicAPI = require('..');
 const Source = require('../../Source');
 const mdBuilder = require('../MDBuilder');
 const jsBuilder = require('../JSBuilder');
-const GoldenUtils = require('../../../../test/golden-utils');
+const { folio } = require('folio');
 
-const {TestRunner, Reporter, Matchers}  = require('../../../testrunner/');
-const runner = new TestRunner();
-const reporter = new Reporter(runner);
-
-const {describe, xdescribe, fdescribe} = runner;
-const {it, fit, xit} = runner;
-const {beforeAll, beforeEach, afterAll, afterEach} = runner;
-
-let browser;
-let page;
-
-beforeAll(async function() {
-  browser = await playwright.launch();
-  page = await browser.defaultContext().newPage();
-});
-
-afterAll(async function() {
+const fixtures = folio.extend();
+fixtures.page.init(async({}, test) => {
+  const browser = await playwright.chromium.launch();
+  const page = await browser.newPage();
+  await test(page);
   await browser.close();
-});
+}, { scope: 'worker' });
+const { describe, it, expect } = fixtures.build();
 
 describe('checkPublicAPI', function() {
-  it('diff-classes', testLint);
-  it('diff-methods', testLint);
-  it('diff-properties', testLint);
-  it('diff-arguments', testLint);
-  it('diff-events', testLint);
-  it('check-duplicates', testLint);
-  it('check-sorting', testLint);
-  it('check-returns', testLint);
-  it('js-builder-common', testJSBuilder);
-  it('js-builder-inheritance', testJSBuilder);
-  it('md-builder-common', testMDBuilder);
+  testLint('diff-classes');
+  testLint('diff-methods');
+  testLint('diff-properties');
+  testLint('diff-arguments');
+  testLint('diff-events');
+  testLint('check-duplicates');
+  testLint('check-sorting');
+  testLint('check-returns');
+  testLint('check-nullish');
+  testJSBuilder('js-builder-common');
+  testJSBuilder('js-builder-inheritance');
+  testMDBuilder('md-builder-common');
+  testMDBuilder('md-builder-comments');
 });
 
-runner.run();
-
-async function testLint(state, test) {
-  const dirPath = path.join(__dirname, test.name);
-  const {expect} = new Matchers({
-    toBeGolden: GoldenUtils.compare.bind(null, dirPath, dirPath)
+async function testLint(name) {
+  it(name, async({page}) => {
+    const dirPath = path.join(__dirname, name);
+    const mdSources = await Source.readdir(dirPath, '.md');
+    const tsSources = await Source.readdir(dirPath, '.ts');
+    const jsSources = await Source.readdir(dirPath, '.js');
+    const messages = await checkPublicAPI(page, mdSources, jsSources.concat(tsSources));
+    const errors = messages.map(message => message.text);
+    expect(errors.join('\n')).toBe(fs.readFileSync(path.join(dirPath, 'result.txt')).toString());
   });
-
-  const mdSources = await Source.readdir(dirPath, '.md');
-  const jsSources = await Source.readdir(dirPath, '.js');
-  const messages = await checkPublicAPI(page, mdSources, jsSources);
-  const errors = messages.map(message => message.text);
-  expect(errors.join('\n')).toBeGolden('result.txt');
 }
 
-async function testMDBuilder(state, test) {
-  const dirPath = path.join(__dirname, test.name);
-  const {expect} = new Matchers({
-    toBeGolden: GoldenUtils.compare.bind(null, dirPath, dirPath)
+async function testMDBuilder(name) {
+  it(name, async({page}) => {
+    const dirPath = path.join(__dirname, name);
+    const sources = await Source.readdir(dirPath, '.md');
+    const {documentation} = await mdBuilder(page, sources, true);
+    expect(serialize(documentation)).toBe(fs.readFileSync(path.join(dirPath, 'result.txt')).toString());
   });
-  const sources = await Source.readdir(dirPath, '.md');
-  const {documentation} = await mdBuilder(page, sources);
-  expect(serialize(documentation)).toBeGolden('result.txt');
 }
 
-async function testJSBuilder(state, test) {
-  const dirPath = path.join(__dirname, test.name);
-  const {expect} = new Matchers({
-    toBeGolden: GoldenUtils.compare.bind(null, dirPath, dirPath)
+async function testJSBuilder(name) {
+  it(name, async() => {
+    const dirPath = path.join(__dirname, name);
+    const jsSources = await Source.readdir(dirPath, '.js');
+    const tsSources = await Source.readdir(dirPath, '.ts');
+    const {documentation} = await jsBuilder.checkSources(jsSources.concat(tsSources));
+    expect(serialize(documentation)).toBe(fs.readFileSync(path.join(dirPath, 'result.txt')).toString());
   });
-  const sources = await Source.readdir(dirPath, '.js');
-  const {documentation} = await jsBuilder(sources);
-  expect(serialize(documentation)).toBeGolden('result.txt');
 }
 
 /**
@@ -98,6 +86,7 @@ function serialize(doc) {
   const result = {
     classes: doc.classesArray.map(cls => ({
       name: cls.name,
+      comment: cls.comment || undefined,
       members: cls.membersArray.map(serializeMember)
     }))
   };
@@ -111,6 +100,7 @@ function serializeMember(member) {
     name: member.name,
     type: serializeType(member.type),
     kind: member.kind,
+    comment: member.comment || undefined,
     args: member.argsArray.length ? member.argsArray.map(serializeMember) : undefined
   }
 }

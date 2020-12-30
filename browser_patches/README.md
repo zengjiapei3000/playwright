@@ -6,6 +6,8 @@ Ideally, all these changes should be upstreamed.
 For the time being, it is possible to setup a browser checkout
 and develop from there.
 
+[WebKit upstream status](webkit/upstream_status.md)
+
 ## 1. Setting up local browser checkout
 
 From the `playwright` repo, run the following command:
@@ -52,16 +54,12 @@ This script will:
 
 If you omit the path to your checkout, the script will assume one is located at `./browser_patches/firefox/checkout`
 
-Send a PR to the PlayWright repo to be reviewed. 
+Send a PR to the Playwright repo to be reviewed.
 
-## 4. Rolling PlayWright to the new browser build
+## 4. Rolling Playwright to the new browser build
 
-Once the patch has been committed, the build bots will kick in, compile and upload a new browser version to all the platforms.
-
-You can check the CDN status:
+Once the patch has been committed, the build bots will kick in, compile and upload a new browser version to all the platforms. Then you can roll the browser:
 
 ```sh
-$ ./browser_patches/tools/check_cdn.sh
+$ node utils/roll_browser.js chromium 123456
 ```
-
-As the builds appear, you can roll to a new browser version in the `./package.json` file.

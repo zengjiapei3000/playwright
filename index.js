@@ -14,25 +14,12 @@
  * limitations under the License.
  */
 
-const { helper } = require('./lib/helper');
-const api = require('./lib/api');
-const packageJson = require('./package.json');
-const { DeviceDescriptors } = require('./lib/deviceDescriptors');
-const { TimeoutError } = require('./lib/errors');
-const { Chromium } = require('./lib/server/chromium');
-const { Firefox } = require('./lib/server/firefox');
-const { WebKit } = require('./lib/server/webkit');
+const { setUnderTest } = require('./lib/utils/utils');
+setUnderTest(); // Note: we must call setUnderTest before initializing.
 
-for (const className in api) {
-  if (typeof api[className] === 'function')
-    helper.installApiHooks(className, api[className]);
-}
+const { Playwright } = require('./lib/server/playwright');
+const { setupInProcess } = require('./lib/inprocess');
+const path = require('path');
 
-module.exports = {
-  devices: DeviceDescriptors,
-  errors: { TimeoutError },
-  selectors: api.Selectors._instance(),
-  chromium: new Chromium(__dirname, packageJson.playwright.chromium_revision),
-  firefox: new Firefox(__dirname, packageJson.playwright.firefox_revision),
-  webkit: new WebKit(__dirname, packageJson.playwright.webkit_revision),
-}
+const playwright = new Playwright(__dirname, require(path.join(__dirname, 'browsers.json'))['browsers']);
+module.exports = setupInProcess(playwright);

@@ -30,15 +30,19 @@ fi
 
 trap "cd $(pwd -P)" EXIT
 cd "$(dirname $0)"
-cd checkout
+SCRIPT_FOLDER="$(pwd -P)"
 
-OBJ_FOLDER=$(ls -1 | grep obj-)
-if [[ $OBJ_FOLDER == "" ]]; then
-  echo "ERROR: cannot find obj-* folder in the checkout/. Did you build?"
-  exit 1;
+if [[ ! -z "${FF_CHECKOUT_PATH}" ]]; then
+  cd "${FF_CHECKOUT_PATH}"
+  echo "WARNING: checkout path from FF_CHECKOUT_PATH env: ${FF_CHECKOUT_PATH}"
+else
+  cd "checkout"
 fi
 
+OBJ_FOLDER="obj-build-playwright"
+
 ./mach package
+node "${SCRIPT_FOLDER}"/install-preferences.js $PWD/$OBJ_FOLDER/dist/firefox
 
 if ! [[ -d $OBJ_FOLDER/dist/firefox ]]; then
   echo "ERROR: cannot find $OBJ_FOLDER/dist/firefox folder in the checkout/. Did you build?"
